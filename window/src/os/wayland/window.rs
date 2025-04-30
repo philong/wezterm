@@ -20,15 +20,15 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle,
     WaylandWindowHandle, WindowHandle,
 };
+use sctk_adwaita::{AdwaitaFrame, FrameConfig};
 use smithay_client_toolkit::compositor::{CompositorHandler, SurfaceData, SurfaceDataExt};
 use smithay_client_toolkit::data_device_manager::ReadPipe;
 use smithay_client_toolkit::globals::GlobalData;
 use smithay_client_toolkit::reexports::csd_frame::{
-    DecorationsFrame, FrameAction, ResizeEdge, WindowState as SCTKWindowState,
+    DecorationsFrame, FrameAction, FrameClick, ResizeEdge, WindowState as SCTKWindowState,
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
 use smithay_client_toolkit::seat::pointer::CursorIcon;
-use smithay_client_toolkit::shell::xdg::fallback_frame::FallbackFrame;
 use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations as Decorations,
     WindowHandler,
@@ -252,10 +252,12 @@ impl WaylandWindow {
 
         window.set_app_id(class_name.to_string());
         window.set_title(name.to_string());
+        let decorations = config.window_decorations;
 
-        let decor_mode = if !config.window_decorations.contains(WindowDecorations::TITLE) {
+        // NOTE: `None` means we don't care, not "no decorations"!
+        let decor_mode = if !decorations.contains(WindowDecorations::TITLE) {
             None
-        } else if config.window_decorations == WindowDecorations::default() {
+        } else if decorations == WindowDecorations::default() {
             Some(DecorationMode::Server)
         } else {
             Some(DecorationMode::Client)
@@ -265,14 +267,22 @@ impl WaylandWindow {
         let mut window_frame = {
             let wayland_state = &conn.wayland_state.borrow();
             let shm = &wayland_state.shm;
+            let compositor = wayland_state.compositor.clone();
             let subcompositor = wayland_state.subcompositor.clone();
-            FallbackFrame::new(&window, shm, subcompositor, qh.clone())
-                .expect("failed to create csd frame")
+            AdwaitaFrame::new(
+                &window,
+                shm,
+                compositor.into(),
+                subcompositor,
+                qh.clone(),
+                FrameConfig::auto().hide_titlebar(!decorations.contains(WindowDecorations::TITLE)),
+            )
+            .expect("failed to create csd frame")
         };
-        let hidden = match decor_mode {
-            Some(DecorationMode::Client) => false,
-            _ => true,
-        };
+        window_frame.set_resizable(decorations.contains(WindowDecorations::RESIZE));
+        // At this point we can't be sure about SSD support, wait for configure
+        // Also: at this point scale is 1, we haven't received a configure yet, so we can use pixel_*
+        let hidden = decorations == WindowDecorations::NONE;
         window_frame.set_hidden(hidden);
         if !hidden {
             window_frame.resize(
@@ -285,11 +295,13 @@ impl WaylandWindow {
 
         window.set_min_size(Some((32, 32)));
         let (x, y) = window_frame.location();
-        let surface_width = dimensions.pixels_to_surface(dimensions.pixel_width as i32);
-        let surface_height = dimensions.pixels_to_surface(dimensions.pixel_height as i32);
+        let (full_w, full_h) = window_frame.add_borders(
+            dimensions.pixel_width as u32,
+            dimensions.pixel_height as u32,
+        );
         window
             .xdg_surface()
-            .set_window_geometry(x, y, surface_width, surface_height);
+            .set_window_geometry(x, y, full_w as i32, full_h as i32);
         window.commit();
 
         let pending_mouse = PendingMouse::create(window_id);
@@ -585,7 +597,7 @@ pub struct WaylandWindowInner {
     pub(crate) events: WindowEventSender,
     surface_factor: f64,
     window: Option<XdgWindow>,
-    pub(super) window_frame: FallbackFrame<WaylandState>,
+    pub(super) window_frame: AdwaitaFrame<WaylandState>,
     dimensions: Dimensions,
     resize_increments: Option<ResizeIncrement>,
     window_state: WindowState,
@@ -726,6 +738,33 @@ impl WaylandWindowInner {
     pub(crate) fn dispatch_pending_mouse(&mut self) {
         let pending_mouse = Arc::clone(&self.pending_mouse);
 
+        if let Some(subsurface_id) = PendingMouse::active_subsurface(&pending_mouse) {
+            if let Some((x, y)) = PendingMouse::coords(&pending_mouse) {
+                if let Some(c) =
+                    self.window_frame
+                        .click_point_moved(Duration::ZERO, &subsurface_id, x, y)
+                {
+                    self.set_cursor(Some(c))
+                };
+            }
+            while let Some((button, state)) = PendingMouse::next_button(&pending_mouse) {
+                let pressed = state == ButtonState::Pressed;
+                let click = match button {
+                    MousePress::Left => FrameClick::Normal,
+                    MousePress::Right => FrameClick::Alternate,
+                    MousePress::Middle => continue,
+                };
+
+                if let Some(action) = self.window_frame.on_click(Duration::ZERO, click, pressed) {
+                    self.frame_action(PendingMouse::last_serial(&pending_mouse), action);
+                }
+            }
+            if !PendingMouse::in_window(&pending_mouse) {
+                self.window_frame.click_point_left();
+            }
+            return;
+        }
+
         if let Some((x, y)) = PendingMouse::coords(&pending_mouse) {
             let coords = Point::new(
                 self.surface_to_pixels(x as i32) as isize,
@@ -863,6 +902,8 @@ impl WaylandWindowInner {
             self.window_frame.update_state(window_config.state);
             self.window_frame
                 .update_wm_capabilities(window_config.capabilities);
+            self.window_frame
+                .set_hidden(window_config.decoration_mode != DecorationMode::Client);
         }
 
         if let Some((mut w, mut h)) = pending.configure.take() {
@@ -882,7 +923,6 @@ impl WaylandWindowInner {
                 let mut pixel_height = self.surface_to_pixels(h.try_into().unwrap());
 
                 if self.window_state.can_resize() {
-                    self.window_frame.set_resizable(true);
                     if let Some(incr) = self.resize_increments {
                         let min_width = incr.base_width + incr.x;
                         let min_height = incr.base_height + incr.y;
@@ -895,6 +935,9 @@ impl WaylandWindowInner {
                         h = self.pixels_to_surface(desired_pixel_height) as u32;
                         pixel_width = self.surface_to_pixels(w.try_into().unwrap());
                         pixel_height = self.surface_to_pixels(h.try_into().unwrap());
+                        if let Some(window) = self.window.as_ref() {
+                            window.set_min_size(Some((min_width as u32, min_height as u32)));
+                        }
                     }
                 }
 
@@ -907,20 +950,24 @@ impl WaylandWindowInner {
 
                 log::trace!("Resizing frame");
                 if !self.window_frame.is_hidden() {
-                    // Clamp the size to at least one surface heigh/width.
-                    let width = NonZeroU32::new(w).unwrap_or(NonZeroU32::new(1).unwrap());
-                    let height = NonZeroU32::new(h).unwrap_or(NonZeroU32::new(1).unwrap());
+                    // Clamp the size to at least one surface height/width.
+                    let width = NonZeroU32::new(w).unwrap_or(NonZeroU32::MIN);
+                    let height = NonZeroU32::new(h).unwrap_or(NonZeroU32::MIN);
                     self.window_frame.resize(width, height);
-                    pending.refresh_decorations = true
+                    self.refresh_frame(); // NOW, not after do_paint(), otherwise desync on resize
                 }
                 let (x, y) = self.window_frame.location();
-                let surface_width = self.pixels_to_surface(pixel_width);
-                let surface_height = self.pixels_to_surface(pixel_height);
+                let (full_w, full_h) = self.window_frame.add_borders(w as u32, h as u32);
                 self.window
                     .as_mut()
                     .unwrap()
                     .xdg_surface()
-                    .set_window_geometry(x, y, surface_width, surface_height);
+                    .set_window_geometry(
+                        x,
+                        y,
+                        full_w.try_into().unwrap(),
+                        full_h.try_into().unwrap(),
+                    );
                 // Compute the new pixel dimensions
                 let new_dimensions = Dimensions {
                     pixel_width: pixel_width.try_into().unwrap(),
@@ -1064,6 +1111,7 @@ impl WaylandWindowInner {
         }
         if let Some(window) = self.window.as_ref() {
             window.set_title(title.clone());
+            self.window_frame.set_title(title.clone());
         }
         self.refresh_frame();
         self.title = Some(title);
@@ -1238,9 +1286,16 @@ impl WaylandWindowInner {
         }
     }
 
-    pub(super) fn frame_action(&mut self, pointer: &WlPointer, serial: u32, action: FrameAction) {
+    pub(super) fn frame_action(&mut self, serial: u32, action: FrameAction) {
+        let conn = Connection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow_mut();
+        let pointer = match &state.pointer {
+            Some(pointer) => pointer.pointer(),
+            None => return,
+        };
         let pointer_data = pointer.data::<PointerUserData>().unwrap();
         let seat = pointer_data.pdata.seat();
+
         match action {
             FrameAction::Close => self.events.dispatch(WindowEvent::CloseRequested),
             FrameAction::Minimize => self.window.as_ref().unwrap().set_minimized(),
@@ -1285,7 +1340,14 @@ impl WaylandWindowInner {
     }
 
     fn config_did_change(&mut self, config: ConfigHandle) {
+        let decorations = config.window_decorations;
         self.config = config;
+        self.window_frame
+            .set_resizable(decorations.contains(WindowDecorations::RESIZE));
+        self.window_frame.set_config(
+            FrameConfig::auto().hide_titlebar(!decorations.contains(WindowDecorations::TITLE)),
+        );
+        self.refresh_frame();
         self.update_window_background_blur();
     }
 
@@ -1402,8 +1464,13 @@ impl WaylandState {
                 let mut changed;
                 pending_event.had_configure_event = true;
                 if let (Some(w), Some(h)) = configure.new_size {
+                    let window_frame = &window_inner.borrow().window_frame;
+                    let (w, h) = window_frame.subtract_borders(w, h);
                     changed = pending_event.configure.is_none();
-                    pending_event.configure.replace((w.get(), h.get()));
+                    pending_event.configure.replace((
+                        w.unwrap_or(NonZeroU32::MIN).get(),
+                        h.unwrap_or(NonZeroU32::MIN).get(),
+                    ));
                 } else {
                     changed = true;
                 }
@@ -1445,10 +1512,22 @@ impl CompositorHandler for WaylandState {
         &mut self,
         _conn: &WConnection,
         _qh: &wayland_client::QueueHandle<Self>,
-        _surface: &wayland_client::protocol::wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wayland_client::protocol::wl_surface::WlSurface,
+        new_factor: i32,
     ) {
-        // We do nothing, we get the scale_factor from surface_data
+        log::trace!("scale_factor_changed: CompositorHandler");
+        // We get the scale_factor from surface_data, we only notify the frame here
+        let main_surface = surface
+            .data::<SurfaceData>()
+            .and_then(|data| data.parent_surface())
+            .unwrap_or(surface);
+        let surface_data = SurfaceUserData::from_wl(main_surface);
+        let window_id = surface_data.window_id;
+
+        WaylandConnection::with_window_inner(window_id, move |inner| {
+            inner.window_frame.set_scaling_factor(new_factor as f64);
+            Ok(())
+        });
     }
 
     fn frame(
