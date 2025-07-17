@@ -347,6 +347,7 @@ impl WaylandWindow {
             wegl_surface: None,
             gl_state: None,
             ext_background_effect_surface: None,
+            start_time: Instant::now(),
         }));
 
         let window_handle = Window::Wayland(WaylandWindow(window_id));
@@ -413,6 +414,13 @@ impl WindowOps for WaylandWindow {
     fn close(&self) {
         WaylandConnection::with_window_inner(self.0, |inner| {
             inner.close();
+            Ok(())
+        });
+    }
+
+    fn request_drag_move(&self) {
+        WaylandConnection::with_window_inner(self.0, |inner| {
+            inner.request_drag_move()?;
             Ok(())
         });
     }
@@ -626,6 +634,7 @@ pub struct WaylandWindowInner {
     wegl_surface: Option<WlEglSurface>,
     gl_state: Option<Rc<glium::backend::Context>>,
     ext_background_effect_surface: Option<ExtBackgroundEffectSurfaceV1>,
+    start_time: Instant,
 }
 
 impl WaylandWindowInner {
@@ -657,6 +666,30 @@ impl WaylandWindowInner {
         if self.window_frame.is_dirty() && !self.window_frame.is_hidden() {
             self.window_frame.draw();
         }
+    }
+
+    fn request_drag_move(&mut self) -> anyhow::Result<()> {
+        let xdg = match &self.window {
+            Some(w) => w,
+            None => return Err(anyhow!("cannot drag: window not initialized")),
+        };
+
+        let conn = Connection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow();
+        let pointer = state
+            .pointer
+            .as_ref()
+            .ok_or_else(|| anyhow!("no pointer available for drag-move"))?;
+        let wl_pointer = pointer.pointer();
+        let pdata = wl_pointer
+            .data::<PointerUserData>()
+            .expect("pointer data must be set");
+        let seat = pdata.pdata.seat();
+
+        let serial = PendingMouse::last_serial(&self.pending_mouse);
+
+        xdg.move_(seat, serial);
+        Ok(())
     }
 
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
@@ -755,13 +788,15 @@ impl WaylandWindowInner {
                     MousePress::Middle => continue,
                 };
 
-                if let Some(action) = self.window_frame.on_click(Duration::ZERO, click, pressed) {
+                let timestamp = Instant::now().duration_since(self.start_time);
+
+                if let Some(action) = self.window_frame.on_click(timestamp, click, pressed) {
                     self.frame_action(PendingMouse::last_serial(&pending_mouse), action);
                 }
             }
-            if !PendingMouse::in_window(&pending_mouse) {
-                self.window_frame.click_point_left();
-            }
+            // if !PendingMouse::in_window(&pending_mouse) {
+            //     self.window_frame.click_point_left();
+            // }
             return;
         }
 
